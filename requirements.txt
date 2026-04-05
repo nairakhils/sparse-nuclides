@@ -1,0 +1,4 @@
+wnnet
+scipy
+numpy
+matplotlib
