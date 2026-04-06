@@ -2,3 +2,5 @@ wnnet
 scipy
 numpy
 matplotlib
+marimo
+altair

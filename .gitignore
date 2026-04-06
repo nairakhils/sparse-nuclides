@@ -56,3 +56,8 @@ coverage.xml
 # OS
 .DS_Store
 Thumbs.db
+
+# Project outputs / cached data
+output/
+data/
+__marimo__/
