@@ -20,7 +20,9 @@ composition (n, h1, he4, c12, o16), this script:
 """
 
 import argparse
+from dataclasses import dataclass
 
+import numpy as np
 import wneq
 import wnnet.nuc as wnuc
 
@@ -37,6 +39,59 @@ SEED_COMPOSITION = {
     ("c12", 6, 12): 0.03,
     ("o16", 8, 16): 0.02,
 }
+
+
+@dataclass
+class EquilibriumResult:
+    """Bundle of equilibrium outputs for callers that want arrays, not prints."""
+    nuc: wnuc.Nuc                    # the wnnet.Nuc object used (reusable)
+    nuclide_order: list              # ordered list of nuclide names (A/Y rows)
+    nuclide_info: dict               # {name: {"z": Z, "a": A, ...}}
+    y_eq: np.ndarray                 # shape (n,), Y_eq aligned with nuclide_order
+    ye: float                        # electron fraction used to fix the NSE
+    zone: dict                       # raw wneq zone dict
+
+
+def compute_equilibrium(
+    t9: float,
+    rho: float,
+    xml_path: str = XML_PATH,
+    nuc_xpath: str = NUC_XPATH,
+    seed: dict = None,
+) -> EquilibriumResult:
+    """Compute NSE abundances at (t9, rho), deriving Ye from the seed.
+
+    Ye = sum_i Z_i * Y_i over the seed composition; species not in the
+    network after `nuc_xpath` filtering are silently skipped when wneq
+    returns mass fractions, and their Y_eq entries are 0.
+    """
+    if seed is None:
+        seed = SEED_COMPOSITION
+
+    ye = sum(z * (x / a) for (_, z, a), x in seed.items())
+
+    nuc = wnuc.Nuc(xml_path, nuc_xpath=nuc_xpath)
+    nuclide_info = nuc.get_nuclides()
+    nuclide_order = list(nuclide_info.keys())
+
+    eq = wneq.Equil(nuc)
+    zone = eq.compute(t9=t9, rho=rho, ye=ye)
+    mass_fracs = zone["mass fractions"]  # {(name, Z, A): X_eq}
+
+    y_eq = np.zeros(len(nuclide_order), dtype=np.float64)
+    for i, name in enumerate(nuclide_order):
+        info = nuclide_info[name]
+        x = mass_fracs.get((name, info["z"], info["a"]), 0.0)
+        y_eq[i] = x / info["a"]
+
+    return EquilibriumResult(
+        nuc=nuc,
+        nuclide_order=nuclide_order,
+        nuclide_info=nuclide_info,
+        y_eq=y_eq,
+        ye=ye,
+        zone=zone,
+    )
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -62,29 +117,20 @@ def parse_args(argv=None) -> argparse.Namespace:
 def main(argv=None) -> None:
     args = parse_args(argv)
 
-    # Seed Y = X / A, and Ye = sum_i Z_i * Y_i.
     y_seed = {name: x / a for (name, _, a), x in SEED_COMPOSITION.items()}
-    ye = sum(z * (x / a) for (_, z, a), x in SEED_COMPOSITION.items())
 
     print(f"Network    : {XML_PATH}  (nuc_xpath = {NUC_XPATH!r})")
     print(f"State      : T9 = {args.t9}, rho = {args.rho:g} g/cc")
-    print(f"Seed Ye    : {ye:.6f}  (from 5-species seed composition)")
 
-    nuc = wnuc.Nuc(XML_PATH, nuc_xpath=NUC_XPATH)
-    nuclide_info = nuc.get_nuclides()
+    result = compute_equilibrium(args.t9, args.rho)
+    nuclide_info = result.nuclide_info
+    nuclide_order = result.nuclide_order
+    mass_fracs = result.zone["mass fractions"]
+    y_eq = {name: float(result.y_eq[i]) for i, name in enumerate(nuclide_order)}
+
+    print(f"Seed Ye    : {result.ye:.6f}  (from 5-species seed composition)")
     print(f"Nuclides   : {len(nuclide_info)} in network after XPath filter")
-
-    # ---- Compute equilibrium ---------------------------------------------
-    print(f"\nComputing NSE at (T9={args.t9}, rho={args.rho:g}, Ye={ye:.4f}) ...")
-    eq = wneq.Equil(nuc)
-    zone = eq.compute(t9=args.t9, rho=args.rho, ye=ye)
-
-    mass_fracs = zone["mass fractions"]  # keyed by (name, Z, A) -> X_eq
-    # wneq only emits entries with X > 0; fill missing species with 0.
-    y_eq = {
-        name: mass_fracs.get((name, info["z"], info["a"]), 0.0) / info["a"]
-        for name, info in nuclide_info.items()
-    }
+    print(f"\nComputing NSE at (T9={args.t9}, rho={args.rho:g}, Ye={result.ye:.4f}) ...")
 
     # ---- Print Y_eq for every nuclide ------------------------------------
     print("\n=== Equilibrium abundances Y_eq (= X_eq / A) ===")
