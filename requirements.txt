@@ -1,4 +1,5 @@
 wnnet
+wneq
 scipy
 numpy
 matplotlib
