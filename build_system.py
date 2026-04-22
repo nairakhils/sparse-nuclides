@@ -13,14 +13,17 @@ save it to disk for later use in a C++/Eigen sparse solver.
 
   * A is a nuclide x nuclide sparse matrix built from
     `wnnet.flows.compute_link_flows`. A[i, j] is the sum of all link flows
-    from source nuclide i to target nuclide j, accumulated across every
-    reaction that emits such a (source, target) link. Because wnnet's
-    link_flows with direction="both" emits a negative self-loop
-    (source, source, -flow) for each reactant as well as positive
-    off-diagonal links to products and fellow reactants, A ends up with
-    positive off-diagonal gain entries and negative diagonal loss entries.
-    This is the time-forward flow-network representation of the network at
-    the given thermodynamic state.
+    from source nuclide j to target nuclide i, accumulated across every
+    reaction that emits such a (source, target) link — i.e. row = target,
+    col = source, matching the standard rate-equation convention
+    dY_i/dt = sum_j A[i, j] * Y_j. Because wnnet's link_flows with
+    direction="both" emits a negative self-loop (s, s, -flow) for each
+    reactant as well as positive off-diagonal links to products and fellow
+    reactants, A ends up with positive off-diagonal entries (gain at row
+    `target` from column `source`) and negative diagonal entries (loss at
+    a nuclide acting as its own source and target). This is the
+    time-forward flow-network representation of the network at the given
+    thermodynamic state.
 
 Outputs (under --out-prefix, default `output/system`):
   <prefix>_A.mtx      Matrix Market coordinate real general
@@ -109,9 +112,11 @@ def build_A_matrix(
 ) -> sp.csr_matrix:
     """Build the nuclide x nuclide flow matrix from link flows.
 
-    Each (source, target, flow) triple contributes `flow` to A[source, target].
-    Duplicate (source, target) contributions from multiple reactions are
-    summed automatically by scipy's COO -> CSR conversion.
+    Each (source, target, flow) triple contributes `flow` to A[target, source]
+    — i.e. row = target, col = source — matching the standard rate-equation
+    convention dY_i/dt = sum_j A[i, j] * Y_j. Duplicate (target, source)
+    contributions from multiple reactions are summed automatically by scipy's
+    COO -> CSR conversion.
     """
     nuc_idx = {name: i for i, name in enumerate(nuclide_order)}
     n = len(nuclide_order)
@@ -127,8 +132,8 @@ def build_A_matrix(
             # from the same Net that produced link_flows_dict).
             if source not in nuc_idx or target not in nuc_idx:
                 continue
-            rows.append(nuc_idx[source])
-            cols.append(nuc_idx[target])
+            rows.append(nuc_idx[target])
+            cols.append(nuc_idx[source])
             vals.append(float(flow))
 
     if not rows:

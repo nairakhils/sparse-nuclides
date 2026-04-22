@@ -77,8 +77,8 @@ def plot_sparsity(A: sp.csr_matrix, save_path: Path, index_path: Path | None) ->
     fig, ax = plt.subplots(figsize=(8, 8))
     ax.spy(A, markersize=3, color="navy")
     ax.set_title(f"Sparsity pattern  ({A.shape[0]}x{A.shape[1]}, {A.nnz} nnz)")
-    ax.set_xlabel("column (target nuclide)")
-    ax.set_ylabel("row (source nuclide)")
+    ax.set_xlabel("column (source nuclide)")
+    ax.set_ylabel("row (target nuclide)")
 
     # If an index file is available, label the axes with nuclide names.
     if index_path and index_path.exists():
