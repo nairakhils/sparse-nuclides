@@ -658,5 +658,625 @@ def _(mo):
     return
 
 
+@app.cell
+def _(mo):
+    mo.md(
+        r"""
+        ---
+        ## 8. Implicit Euler Formulation
+
+        Coming back to this a few weeks later: I've been thinking about the
+        rank-deficiency problem from the other direction. Instead of solving
+        $A y = b$ directly, I discretize the rate equation $dY/dt = A\,Y$ with
+        backward Euler and solve the *timestep* system
+
+        $$
+        (I + A\,\Delta t)\,Y(t + \Delta t) = Y(t),
+        $$
+
+        which the professor writes as $M\,Y(t+\Delta t) = Y(t)$ with
+        $M = I + A\,\Delta t$. The diagonal gets an extra $+1$ from $I$, so for
+        small $\Delta t$ the matrix is essentially the identity and trivially
+        invertible; as $\Delta t$ grows, $A\,\Delta t$ takes over and $M$
+        inherits $A$'s pathologies. The RHS is just the current state vector
+        $Y(t)$ — no flow-accumulation gymnastics.
+
+        For the state $Y(t)$ I use the nuclear statistical equilibrium
+        abundances from `wneq` at the same $(T_9, \rho)$ — that's what we
+        expect the network to relax to, so testing the timestep system there
+        is a meaningful stress test.
+        """
+    )
+    return
+
+
+@app.cell
+def _(NUC_XPATH, RHO, T9, XML_PATH, mo, net, np):
+    import wnnet.flows as _wflows
+
+    from build_system import build_A_matrix as _build_A_matrix
+    from build_euler_system import composition_from_Y as _composition_from_Y
+    from equilibrium import compute_equilibrium as _compute_equilibrium
+
+    _eq = _compute_equilibrium(T9, RHO, xml_path=str(XML_PATH), nuc_xpath=NUC_XPATH)
+    nuclide_order_eq = _eq.nuclide_order
+    nuclide_info_eq = _eq.nuclide_info
+    Y_eq = _eq.y_eq
+
+    _comp_eq = _composition_from_Y(Y_eq, nuclide_order_eq, nuclide_info_eq)
+    _link_flows_eq = _wflows.compute_link_flows(net, T9, RHO, _comp_eq)
+    A_eq = _build_A_matrix(_link_flows_eq, nuclide_order_eq)
+
+    mo.md(f"""
+**Equilibrium state at T9 = {T9}, ρ = {RHO:.1e} g/cm³:**
+
+| Quantity | Value |
+|----------|-------|
+| $Y_e$ (from seed) | {_eq.ye:.4f} |
+| Species with $X > 0$ | {len(_comp_eq)} / {len(nuclide_order_eq)} |
+| $\\|Y_{{\\mathrm{{eq}}}}\\|_2$ | {np.linalg.norm(Y_eq):.3e} |
+| $\\sum_i A_i Y_i$ | {float(np.sum([nuclide_info_eq[n]['a'] * Y_eq[i] for i, n in enumerate(nuclide_order_eq)])):.6f} |
+| $A_{{\\mathrm{{eq}}}}$ shape | {A_eq.shape[0]} × {A_eq.shape[1]}, nnz = {A_eq.nnz} |
+| $\\|A_{{\\mathrm{{eq}}}}\\|_F$ | {float((A_eq.multiply(A_eq)).sum()**0.5):.3e} |
+
+Note that $A_{{\\mathrm{{eq}}}}$ here is rebuilt from the equilibrium composition,
+not the 5-species seed used in section 3, so this is a different matrix —
+every species has nonzero abundance, which should knock out the obvious
+rank defect from unseeded rows.
+""")
+    return A_eq, Y_eq, nuclide_info_eq, nuclide_order_eq
+
+
+@app.cell
+def _(mo):
+    dt_slider = mo.ui.slider(
+        start=-6.0, stop=1.0, step=0.5, value=-3.0,
+        label="log₁₀(Δt)", show_value=True,
+    )
+    mo.vstack([
+        mo.md("**Δt** (timestep for M = I + A·Δt). Slider is log-scaled."),
+        dt_slider,
+    ])
+    return (dt_slider,)
+
+
+@app.cell
+def _(A_eq, dt_slider, mo, np, nuclide_order_eq, plt, sp):
+    from build_euler_system import build_M as _build_M
+    from conservation import dense_condition_number as _cond
+
+    dt = 10 ** dt_slider.value
+    M = _build_M(A_eq, dt)
+    M_dense = M.toarray()
+    cond_M = _cond(M_dense)
+    norm_A_dt = float((A_eq.multiply(A_eq)).sum() ** 0.5) * dt
+    norm_I = float(np.sqrt(M.shape[0]))
+    regime_ratio = norm_A_dt / norm_I
+
+    fig_euler, ax_euler = plt.subplots(figsize=(8, 8))
+    ax_euler.spy(M, markersize=4, color="darkgreen")
+    ax_euler.set_title(
+        f"M = I + A·Δt sparsity  (Δt = {dt:g}, nnz = {M.nnz})"
+    )
+    ax_euler.set_xlabel("column (source nuclide)")
+    ax_euler.set_ylabel("row (target nuclide)")
+    if len(nuclide_order_eq) == M.shape[0]:
+        ax_euler.set_xticks(range(len(nuclide_order_eq)))
+        ax_euler.set_xticklabels(nuclide_order_eq, rotation=90, fontsize=6)
+        ax_euler.set_yticks(range(len(nuclide_order_eq)))
+        ax_euler.set_yticklabels(nuclide_order_eq, fontsize=6)
+    fig_euler.tight_layout()
+
+    mo.vstack([
+        mo.md(f"""
+| Quantity | Value |
+|----------|-------|
+| Δt | {dt:.3e} |
+| M shape | {M.shape[0]} × {M.shape[1]} |
+| nnz(M) | {M.nnz} |
+| $\\kappa_2(M)$ | {cond_M:.3e} |
+| $\\|A\\Delta t\\|_F / \\|I\\|_F$ | {regime_ratio:.3e} |
+| Regime | {"M ≈ I" if regime_ratio < 0.1 else "M ≈ A·Δt" if regime_ratio > 10 else "transition"} |
+"""),
+        fig_euler,
+        mo.md(
+            "Sliding Δt from $10^{-6}$ up to $10^1$, I watch $\\kappa_2(M)$ "
+            "climb by many orders of magnitude. Even at the smallest Δt on "
+            "this slider, the perturbation $A\\,\\Delta t$ is already much "
+            "larger than $I$ in Frobenius norm — our $A$ entries are huge "
+            "(reaction rates in raw units), so the identity regime sits at "
+            "physically irrelevant Δt values. The interesting middle is "
+            "where Δt is around $10^{-14}$, but that's not useful for actual "
+            "timestepping. This is a hint we should non-dimensionalize $A$ "
+            "at some point."
+        ),
+    ])
+    return M, M_dense, cond_M, dt
+
+
+@app.cell
+def _(mo):
+    mo.md(
+        r"""
+        ---
+        ## 9. Conservation Row Modification
+
+        Here's the trick I wanted to try: replace the **last row** of $M$ with
+        a scaled mass-conservation constraint. Baryon number is conserved
+        exactly by the physics ($\sum_i A_i\,dY_i/dt = 0$), so we can swap out
+        one of the (likely near-singular) rows for
+
+        $$
+        \alpha\,[A_1, A_2, \ldots, A_N]\,Y = \alpha\,\sum_i A_i\,Y_i
+        $$
+
+        The RHS value is $\alpha \cdot 1$ since mass fractions sum to one.
+        The scalar $\alpha$ is a row-weight: too small and the new row
+        vanishes into noise; too large and it dominates every singular value.
+        There's a sweet spot in between, which I swept over in
+        `conservation.py` and now re-plot reactively here.
+        """
+    )
+    return
+
+
+@app.cell
+def _(mo):
+    alpha_slider = mo.ui.slider(
+        start=-10.0, stop=10.0, step=0.5, value=2.0,
+        label="log₁₀(α)", show_value=True,
+    )
+    mo.vstack([
+        mo.md("**α** (weight on the conservation row). Slider is log-scaled."),
+        alpha_slider,
+    ])
+    return (alpha_slider,)
+
+
+@app.cell
+def _(
+    M_dense,
+    Y_eq,
+    alpha_slider,
+    mo,
+    np,
+    nuclide_info_eq,
+    nuclide_order_eq,
+    plt,
+):
+    from conservation import (
+        apply_conservation_row as _apply_row,
+        dense_condition_number as _cond,
+        find_best_alpha as _find_best_alpha,
+    )
+
+    A_vec = np.array(
+        [nuclide_info_eq[name]["a"] for name in nuclide_order_eq],
+        dtype=np.float64,
+    )
+    alpha = 10 ** alpha_slider.value
+
+    alpha_best, cond_best, alphas, conds = _find_best_alpha(M_dense, A_vec)
+    cond_at_slider = _cond(_apply_row(M_dense, A_vec, alpha))
+    cond_unmod = _cond(M_dense)
+
+    M_mod = _apply_row(M_dense, A_vec, alpha)
+    sum_AY = float(A_vec @ Y_eq)
+    b_mod = Y_eq.copy()
+    b_mod[-1] = alpha * sum_AY
+
+    fig_alpha, ax_alpha = plt.subplots(figsize=(8, 5))
+    ax_alpha.loglog(alphas, conds, marker="o", markersize=4, color="navy",
+                    label=r"$\kappa_2(M_{\mathrm{mod}})$")
+    ax_alpha.axvline(alpha, color="crimson", linestyle="-", linewidth=1.2,
+                     label=fr"slider $\alpha$ = {alpha:.2e}")
+    ax_alpha.axvline(alpha_best, color="goldenrod", linestyle="--", linewidth=1,
+                     label=fr"sweep-optimal $\alpha$ = {alpha_best:.2e}")
+    ax_alpha.axhline(cond_unmod, color="gray", linestyle=":", linewidth=1,
+                     label=fr"unmodified $\kappa_2(M)$ = {cond_unmod:.2e}")
+    ax_alpha.set_xlabel(r"$\alpha$")
+    ax_alpha.set_ylabel(r"$\kappa_2$")
+    ax_alpha.set_title("Conditioning vs. conservation-row scale α")
+    ax_alpha.grid(True, which="both", alpha=0.3)
+    ax_alpha.legend(loc="best", fontsize=9)
+    fig_alpha.tight_layout()
+
+    mo.vstack([
+        mo.md(f"""
+| Quantity | Value |
+|----------|-------|
+| α (slider) | {alpha:.3e} |
+| $\\kappa_2(M_{{\\mathrm{{mod}}}})$ at slider α | {cond_at_slider:.3e} |
+| sweep-optimal α | {alpha_best:.3e} |
+| $\\kappa_2(M_{{\\mathrm{{mod}}}})$ at optimum | {cond_best:.3e} |
+| unmodified $\\kappa_2(M)$ | {cond_unmod:.3e} |
+"""),
+        fig_alpha,
+    ])
+    return A_vec, M_mod, alpha, alpha_best, b_mod
+
+
+@app.cell
+def _(M, M_mod, Y_eq, b_mod, mo, np):
+    import warnings as _warnings
+    import scipy.sparse as _sp
+    import scipy.sparse.linalg as _spla
+
+    def _run_bicgstab(A_, b_):
+        iters = [0]
+        def _cb(_xk):
+            iters[0] += 1
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore")
+            x, info = _spla.bicgstab(A_, b_, rtol=1e-10, maxiter=1000, callback=_cb)
+        return x, iters[0], info
+
+    def _run_gmres(A_, b_):
+        iters = [0]
+        def _cb(_pr):
+            iters[0] += 1
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore")
+            x, info = _spla.gmres(
+                A_, b_, rtol=1e-10, maxiter=1000, restart=30,
+                callback=_cb, callback_type="pr_norm",
+            )
+        return x, iters[0], info
+
+    def _resid(A_, x, b_):
+        b_norm = float(np.linalg.norm(b_))
+        if not np.isfinite(x).all() or b_norm == 0.0:
+            return float("nan"), float("nan")
+        r = A_ @ x - b_
+        rn = float(np.linalg.norm(r))
+        return rn, rn / b_norm
+
+    def _status(info):
+        if info == 0:
+            return "converged"
+        return "not converged" if info > 0 else "breakdown"
+
+    _rows = []
+
+    # Sparse M @ Y_eq on unmodified system
+    x_bu, it_bu, i_bu = _run_bicgstab(M, Y_eq)
+    r_bu, rr_bu = _resid(M, x_bu, Y_eq)
+    _rows.append({
+        "Method": "BiCGSTAB", "Matrix": "M (unmodified)",
+        "Status": _status(i_bu), "Iters": str(it_bu),
+        "||Mx−b||": f"{r_bu:.3e}", "||Mx−b||/||b||": f"{rr_bu:.3e}",
+    })
+    x_gu, it_gu, i_gu = _run_gmres(M, Y_eq)
+    r_gu, rr_gu = _resid(M, x_gu, Y_eq)
+    _rows.append({
+        "Method": "GMRES(30)", "Matrix": "M (unmodified)",
+        "Status": _status(i_gu), "Iters": str(it_gu),
+        "||Mx−b||": f"{r_gu:.3e}", "||Mx−b||/||b||": f"{rr_gu:.3e}",
+    })
+
+    # M_mod is a dense ndarray; scipy's Krylov solvers accept that directly.
+    _M_mod_sparse = _sp.csr_matrix(M_mod)
+    x_bm, it_bm, i_bm = _run_bicgstab(_M_mod_sparse, b_mod)
+    r_bm, rr_bm = _resid(_M_mod_sparse, x_bm, b_mod)
+    _rows.append({
+        "Method": "BiCGSTAB", "Matrix": "M_mod (cons. row)",
+        "Status": _status(i_bm), "Iters": str(it_bm),
+        "||Mx−b||": f"{r_bm:.3e}", "||Mx−b||/||b||": f"{rr_bm:.3e}",
+    })
+    x_gm, it_gm, i_gm = _run_gmres(_M_mod_sparse, b_mod)
+    r_gm, rr_gm = _resid(_M_mod_sparse, x_gm, b_mod)
+    _rows.append({
+        "Method": "GMRES(30)", "Matrix": "M_mod (cons. row)",
+        "Status": _status(i_gm), "Iters": str(it_gm),
+        "||Mx−b||": f"{r_gm:.3e}", "||Mx−b||/||b||": f"{rr_gm:.3e}",
+    })
+
+    mo.vstack([
+        mo.ui.table(_rows, label="Solver comparison: M vs M_mod"),
+        mo.md(
+            "What I see across the α slider: at tiny α the conservation row "
+            "collapses and $M_{\\mathrm{mod}}$ gets **worse** than the "
+            "unmodified system. Past about α ≈ 1 the two matrices behave "
+            "similarly on cond, but the solver residuals for $M_{\\mathrm{mod}}$ "
+            "tend to be better-behaved — the replaced row is a clean, "
+            "well-scaled linear constraint instead of whichever near-zero row "
+            "was there before. GMRES benefits more from this than BiCGSTAB in "
+            "my experiments."
+        ),
+    ])
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(
+        r"""
+        ---
+        ## 10. Convergence Near Equilibrium
+
+        The pessimistic test: fix Δt = 1.0 (the A·Δt-dominated regime) and
+        sweep $T_9$ across 20 log-spaced points from 0.5 to 10. At each
+        point I compute the equilibrium abundances, rebuild $A_{\mathrm{eq}}$
+        and $M$, find the best α for the conservation row, and run all four
+        solver configurations (BiCGSTAB / GMRES × unmodified / modified).
+        This is the regime where the solvers actually struggle — which is
+        the point. I want to see whether the conservation row buys us
+        robustness across the whole temperature range.
+
+        The sweep below takes roughly 30–60 seconds on first load because it
+        rebuilds everything per $T_9$ point. Marimo caches it afterwards, so
+        the slider at the bottom responds instantly.
+        """
+    )
+    return
+
+
+@app.cell
+def _(NUC_XPATH, XML_PATH, mo, np, rho_slider):
+    from convergence_study import (
+        build_system_at as _build_sys,
+        solve_bicgstab as _solve_bicgstab,
+        solve_gmres as _solve_gmres,
+        mass_vector as _mass_vector,
+    )
+    from conservation import (
+        apply_conservation_row as _apply_row,
+        dense_condition_number as _dcond,
+        find_best_alpha as _find_best_alpha,
+    )
+    import scipy.sparse as _sp
+
+    SWEEP_DT = 1.0
+    SWEEP_TOL = 1e-10
+    SWEEP_MAXITER = 1000
+    SWEEP_N = 20
+
+    RHO_sweep = 10 ** rho_slider.value
+    t9_grid = np.logspace(np.log10(0.5), np.log10(10.0), SWEEP_N)
+    n_pts = len(t9_grid)
+
+    def _ninf():
+        return np.full(n_pts, np.nan)
+
+    cond_unmod_arr = _ninf()
+    cond_mod_arr = _ninf()
+    alpha_best_arr = _ninf()
+
+    # Each config: (iters[], rel_res[], converged[])
+    configs = ("bicg_unmod", "gmres_unmod", "bicg_mod", "gmres_mod")
+    iters_d = {c: _ninf() for c in configs}
+    res_d = {c: _ninf() for c in configs}
+    conv_d = {c: np.zeros(n_pts, dtype=bool) for c in configs}
+    M_store = [None] * n_pts  # keep sparse M per T9 for the slider spy plot
+
+    print(f"Running 20-point T9 sweep at dt={SWEEP_DT}, rho={RHO_sweep:g} ...")
+    for _k, _t9 in enumerate(t9_grid):
+        try:
+            _M_k, _Y_k, _nord_k, _ninfo_k = _build_sys(
+                _t9, RHO_sweep, SWEEP_DT, str(XML_PATH), NUC_XPATH,
+            )
+        except Exception as _exc:
+            print(f"  [{_k+1:2d}/{n_pts}] T9={_t9:6.3f}  skipped: {_exc}")
+            continue
+
+        M_store[_k] = _M_k
+        _M_k_dense = _M_k.toarray()
+        cond_unmod_arr[_k] = _dcond(_M_k_dense)
+
+        _A_vec_k = _mass_vector(_nord_k, _ninfo_k)
+        _a_best, _c_best, _, _ = _find_best_alpha(_M_k_dense, _A_vec_k)
+        alpha_best_arr[_k] = _a_best
+        cond_mod_arr[_k] = _c_best
+
+        _M_mod_k = _sp.csr_matrix(_apply_row(_M_k_dense, _A_vec_k, _a_best))
+        _b_unmod_k = _Y_k.copy()
+        _b_mod_k = _Y_k.copy()
+        _b_mod_k[-1] = _a_best * float(_A_vec_k @ _Y_k)
+
+        for _cfg, _Ain, _bin, _solver in (
+            ("bicg_unmod",  _M_k,     _b_unmod_k, _solve_bicgstab),
+            ("gmres_unmod", _M_k,     _b_unmod_k, _solve_gmres),
+            ("bicg_mod",    _M_mod_k, _b_mod_k,   _solve_bicgstab),
+            ("gmres_mod",   _M_mod_k, _b_mod_k,   _solve_gmres),
+        ):
+            if _solver is _solve_gmres:
+                _x, _it, _info = _solver(_Ain, _bin, SWEEP_TOL, SWEEP_MAXITER, 30)
+            else:
+                _x, _it, _info = _solver(_Ain, _bin, SWEEP_TOL, SWEEP_MAXITER)
+            iters_d[_cfg][_k] = _it
+            if np.isfinite(_x).all():
+                _b_norm = float(np.linalg.norm(_bin))
+                res_d[_cfg][_k] = (
+                    float(np.linalg.norm(_Ain @ _x - _bin)) / _b_norm
+                    if _b_norm > 0 else float("nan")
+                )
+            conv_d[_cfg][_k] = (_info == 0)
+        print(f"  [{_k+1:2d}/{n_pts}] T9={_t9:6.3f}  "
+              f"cond(M)={cond_unmod_arr[_k]:.2e}  "
+              f"cond(Mmod)={cond_mod_arr[_k]:.2e}")
+
+    sweep = {
+        "t9_grid": t9_grid,
+        "cond_unmod": cond_unmod_arr,
+        "cond_mod": cond_mod_arr,
+        "alpha_best": alpha_best_arr,
+        "iters": iters_d,
+        "res": res_d,
+        "conv": conv_d,
+        "M_store": M_store,
+        "dt": SWEEP_DT,
+        "tol": SWEEP_TOL,
+        "maxiter": SWEEP_MAXITER,
+    }
+
+    _total = {_c: int(conv_d[_c].sum()) for _c in configs}
+    mo.md(f"""
+Sweep complete. Δt = {SWEEP_DT:g}, ρ = {RHO_sweep:g}, rtol = {SWEEP_TOL:g}.
+
+| Config | Converged |
+|--------|-----------|
+| BiCGSTAB, unmodified | {_total["bicg_unmod"]} / {n_pts} |
+| GMRES(30), unmodified | {_total["gmres_unmod"]} / {n_pts} |
+| BiCGSTAB, conservation row | {_total["bicg_mod"]} / {n_pts} |
+| GMRES(30), conservation row | {_total["gmres_mod"]} / {n_pts} |
+""")
+    return (sweep,)
+
+
+@app.cell
+def _(plt, sweep):
+    fig_cond_t9, ax_c = plt.subplots(figsize=(8, 5))
+    ax_c.loglog(sweep["t9_grid"], sweep["cond_unmod"], marker="o",
+                color="navy", label=r"$\kappa_2(M)$ unmodified")
+    ax_c.loglog(sweep["t9_grid"], sweep["cond_mod"], marker="s",
+                color="crimson", label=r"$\kappa_2(M_{\mathrm{mod}})$")
+    ax_c.set_xlabel(r"$T_9$")
+    ax_c.set_ylabel(r"$\kappa_2$")
+    ax_c.set_title(f"Condition number vs T9  (Δt = {sweep['dt']:g})")
+    ax_c.grid(True, which="both", alpha=0.3)
+    ax_c.legend(loc="best")
+    fig_cond_t9.tight_layout()
+    fig_cond_t9
+    return
+
+
+@app.cell
+def _(plt, sweep):
+    def _plot_iters():
+        styles = {
+            "bicg_unmod":  ("BiCGSTAB, unmodified",  "o", "-",  "navy"),
+            "gmres_unmod": ("GMRES(30), unmodified", "^", "-",  "steelblue"),
+            "bicg_mod":    ("BiCGSTAB, cons. row",   "s", "--", "crimson"),
+            "gmres_mod":   ("GMRES(30), cons. row",  "D", "--", "darkorange"),
+        }
+        fig, ax = plt.subplots(figsize=(8, 5))
+        for c, (lbl, mk, ls, col) in styles.items():
+            ax.loglog(sweep["t9_grid"], sweep["iters"][c],
+                      marker=mk, linestyle=ls, color=col, label=lbl)
+        ax.axhline(sweep["maxiter"], color="gray", linestyle=":",
+                   linewidth=1, label=f"maxiter = {sweep['maxiter']}")
+        ax.set_xlabel(r"$T_9$")
+        ax.set_ylabel("iterations")
+        ax.set_title(f"Iterations vs T9  (Δt = {sweep['dt']:g}, rtol = {sweep['tol']:g})")
+        ax.grid(True, which="both", alpha=0.3)
+        ax.legend(loc="best", fontsize=9)
+        fig.tight_layout()
+        return fig
+
+    fig_iter_t9 = _plot_iters()
+    fig_iter_t9
+    return
+
+
+@app.cell
+def _(plt, sweep):
+    def _plot_res():
+        styles = {
+            "bicg_unmod":  ("BiCGSTAB, unmodified",  "o", "-",  "navy"),
+            "gmres_unmod": ("GMRES(30), unmodified", "^", "-",  "steelblue"),
+            "bicg_mod":    ("BiCGSTAB, cons. row",   "s", "--", "crimson"),
+            "gmres_mod":   ("GMRES(30), cons. row",  "D", "--", "darkorange"),
+        }
+        fig, ax = plt.subplots(figsize=(8, 5))
+        for c, (lbl, mk, ls, col) in styles.items():
+            ax.loglog(sweep["t9_grid"], sweep["res"][c],
+                      marker=mk, linestyle=ls, color=col, label=lbl)
+        ax.axhline(sweep["tol"], color="gray", linestyle=":", linewidth=1,
+                   label=f"rtol target = {sweep['tol']:g}")
+        ax.set_xlabel(r"$T_9$")
+        ax.set_ylabel(r"$\|Mx - b\| / \|b\|$")
+        ax.set_title(f"Relative residual vs T9  (Δt = {sweep['dt']:g})")
+        ax.grid(True, which="both", alpha=0.3)
+        ax.legend(loc="best", fontsize=9)
+        fig.tight_layout()
+        return fig
+
+    fig_res_t9 = _plot_res()
+    fig_res_t9
+    return
+
+
+@app.cell
+def _(mo, sweep):
+    _n = len(sweep["t9_grid"])
+    t9_probe = mo.ui.slider(
+        start=0, stop=_n - 1, step=1, value=_n // 2,
+        label=f"T9 index (0 .. {_n-1})", show_value=True,
+    )
+    mo.vstack([
+        mo.md("**Reactive probe:** move the slider to inspect the "
+              "matrix and solver status at a specific $T_9$ from the sweep."),
+        t9_probe,
+    ])
+    return (t9_probe,)
+
+
+@app.cell
+def _(mo, plt, sweep, t9_probe):
+    def _render_probe():
+        idx = int(t9_probe.value)
+        t9_val = float(sweep["t9_grid"][idx])
+        M_at = sweep["M_store"][idx]
+
+        def fmt(x, f=".3e"):
+            return "nan" if x != x else format(x, f)  # x != x catches NaN
+
+        def conv_str(cfg):
+            ok = bool(sweep["conv"][cfg][idx])
+            it = sweep["iters"][cfg][idx]
+            it_str = "nan" if it != it else str(int(it))
+            return f"{'✓' if ok else '✗'} {it_str} iters, rel_res = {fmt(sweep['res'][cfg][idx])}"
+
+        metrics = mo.md(f"""
+**At T9 = {t9_val:.3f}** (index {idx}):
+
+| Quantity | Value |
+|----------|-------|
+| $\\kappa_2(M)$ | {fmt(sweep["cond_unmod"][idx])} |
+| $\\kappa_2(M_{{\\mathrm{{mod}}}})$ | {fmt(sweep["cond_mod"][idx])} |
+| optimal $\\alpha$ | {fmt(sweep["alpha_best"][idx])} |
+| BiCGSTAB, unmodified | {conv_str("bicg_unmod")} |
+| GMRES(30), unmodified | {conv_str("gmres_unmod")} |
+| BiCGSTAB, cons. row | {conv_str("bicg_mod")} |
+| GMRES(30), cons. row | {conv_str("gmres_mod")} |
+""")
+
+        if M_at is None:
+            return mo.vstack([metrics, mo.md("*(M failed to build at this T9.)*")])
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+        ax.spy(M_at, markersize=4, color="purple")
+        ax.set_title(f"M at T9 = {t9_val:.3f}  "
+                     f"(nnz = {M_at.nnz}, κ₂ = {fmt(sweep['cond_unmod'][idx])})")
+        ax.set_xlabel("column (source)")
+        ax.set_ylabel("row (target)")
+        fig.tight_layout()
+        return mo.vstack([metrics, fig])
+
+    _render_probe()
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(
+        r"""
+        Moving the slider from low $T_9$ to high $T_9$, the condition number
+        of the unmodified $M$ climbs several orders of magnitude — which is
+        really just the condition number of $A$ leaking through, since at
+        $\Delta t = 1$ we're firmly in the $A\,\Delta t$-dominated regime.
+        The conservation-row variant tracks closely on the condition axis
+        but the solvers on $M_{\mathrm{mod}}$ are noticeably more robust, and
+        GMRES with the conservation row converges across a much larger swath
+        of the temperature range than any other configuration. That matches
+        what we want from this formulation: the row replacement doesn't
+        magically shrink the condition number, but it swaps a near-singular
+        row for a well-scaled linear constraint that iterative solvers can
+        actually make progress on.
+        """
+    )
+    return
+
+
 if __name__ == "__main__":
     app.run()
