@@ -52,6 +52,35 @@ def dense_condition_number(M: np.ndarray) -> float:
     return float("inf") if smin == 0 else float(smax / smin)
 
 
+def apply_conservation_row(
+    M: np.ndarray, A_vec: np.ndarray, alpha: float
+) -> np.ndarray:
+    """Return a copy of dense M with its last row replaced by alpha * A_vec."""
+    Mm = M.copy()
+    Mm[-1, :] = alpha * A_vec
+    return Mm
+
+
+def find_best_alpha(
+    M_dense: np.ndarray,
+    A_vec: np.ndarray,
+    alphas: np.ndarray = None,
+) -> tuple:
+    """Sweep alpha and return (alpha_best, cond_best, alphas, conds).
+
+    The last row of M is replaced by `alpha * A_vec`, then the 2-norm
+    condition number is evaluated via dense SVD. Default sweep is 50
+    log-spaced points from 1e-10 to 1e10.
+    """
+    if alphas is None:
+        alphas = np.logspace(-10, 10, 50)
+    conds = np.empty_like(alphas)
+    for i, a in enumerate(alphas):
+        conds[i] = dense_condition_number(apply_conservation_row(M_dense, A_vec, a))
+    k = int(np.argmin(conds))
+    return float(alphas[k]), float(conds[k]), alphas, conds
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Sweep the mass-conservation row weight alpha and plot "
@@ -98,18 +127,11 @@ def main(argv=None) -> None:
     b = Y.copy()  # RHS is Y(t), as in build_euler_system.py
 
     # ---- Alpha sweep ------------------------------------------------------
-    alphas = np.logspace(-10, 10, 50)
-    conds = np.empty_like(alphas)
-    for i, alpha in enumerate(alphas):
-        Mm = M_dense.copy()
-        Mm[-1, :] = alpha * A_vec
-        # Track the RHS modification for documentation (not used in SVD).
-        b_last = alpha * sum_AY  # noqa: F841
-        conds[i] = dense_condition_number(Mm)
-
+    alpha_best, cond_best, alphas, conds = find_best_alpha(M_dense, A_vec)
     best = int(np.argmin(conds))
-    alpha_best, cond_best = alphas[best], conds[best]
     cond_baseline = dense_condition_number(M_dense)  # unmodified M, for context
+    # RHS modification at the optimum (documented; not used downstream).
+    b_last_opt = alpha_best * sum_AY  # noqa: F841
 
     print("\n=== alpha sweep ===")
     print(f"unmodified M      : cond_2 = {cond_baseline:.3e}")
