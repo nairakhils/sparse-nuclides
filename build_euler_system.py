@@ -2,14 +2,22 @@
 build_euler_system.py
 =====================
 
-Assemble the implicit Euler matrix
+Assemble the backward-Euler matrix
 
-    M = I + A * dt
+    M = I - A * dt
 
-where A is the rate matrix built from a webnucleo network (same
-construction as build_system.py -- imported build_A_matrix) and dt is a
-timestep parameter. The right-hand side Y(t) is taken to be the
-equilibrium abundance vector Y_eq returned by wneq at the same (t9, rho).
+for the rate equation dY/dt = A * Y. The wnnet rate matrix A has
+*negative* diagonal entries (depletion), so backward Euler gives
+
+    (I - dt*A) Y^{n+1} = Y^n
+
+with M_ii = 1 + |A_ii|*dt > 0 and growing with dt. The professor's
+convention A_prof = -A_wnnet (positive diagonal) writes the same
+operator as (I + A_prof*dt) Y^{n+1} = Y^n; we use the wnnet sign
+convention here because it matches what wnnet.flows.compute_link_flows
+emits. A is built via the same build_A_matrix as build_system.py, and
+the RHS Y(t) is the equilibrium abundance vector Y_eq returned by wneq
+at the same (t9, rho).
 
 Outputs (under --out-prefix, default `output/euler`):
     <prefix>_M.mtx       Matrix Market coordinate real general
@@ -17,10 +25,16 @@ Outputs (under --out-prefix, default `output/euler`):
     <prefix>_index.json  {"nuclides": [...]}    (row/column ordering of M)
 
 After the main dt is written to disk, the script re-builds M at
-dt = 1e-6, 1e-3, and 1.0 and reports the 2-norm condition number of
-each. Small dt => M ~= I => cond ~= 1. Large dt => M ~= A*dt, and the
-condition number of M approaches that of A (which, being a rate matrix
-with a conservation null space, is ill-conditioned).
+dt = 1e-6, 1e-3, and 1.0 and reports cond_2(M), min/max diag(M), and
+the Frobenius ratio. In the idealized case (uniform |A_ii|, modest
+off-diagonals) cond_2(M) would fall toward 1 as dt grows. For A built
+at the equilibrium composition that's not what we see: a few rows have
+|A_ii| ~ 0 (forward/reverse cancellation) paired with large
+off-diagonals, so M never becomes uniformly diagonally dominant and
+cond_2(M) still scales ~linearly with dt. The hard regime is
+proximity-to-equilibrium, not large-dt, and the structural fix for it
+is the conservation-row augmentation in conservation.py -- see the
+convergence_study.py output for how that plays out across T9.
 """
 
 import argparse
@@ -39,9 +53,19 @@ from equilibrium import compute_equilibrium
 
 
 def build_M(A: sp.csr_matrix, dt: float) -> sp.csr_matrix:
-    """Return M = I + A*dt as a CSR matrix."""
+    """Return M = I - A*dt as a CSR matrix (backward Euler).
+
+    The wnnet rate matrix A has negative diagonal (depletion terms), so
+    backward Euler Y^{n+1} - Y^n = dt * A * Y^{n+1} gives
+    (I - dt*A) Y^{n+1} = Y^n. The diagonal of M is 1 - A_ii*dt = 1 + |A_ii|*dt,
+    positive and growing with dt -> diagonally dominant at large dt.
+
+    The professor's convention A_prof = -A_wnnet (positive diagonal) writes
+    the same operator as M = I + A_prof * dt. We use the wnnet convention
+    internally because it's what wnnet.flows.compute_link_flows emits.
+    """
     n = A.shape[0]
-    return (sp.eye(n, format="csr", dtype=np.float64) + dt * A).tocsr()
+    return (sp.eye(n, format="csr", dtype=np.float64) - dt * A).tocsr()
 
 
 def condition_number(M: sp.csr_matrix) -> float:
@@ -141,18 +165,23 @@ def main(argv=None) -> None:
     A = build_A_matrix(link_flows, nuclide_order)
     print(f"  A: shape={A.shape}, nnz={A.nnz}")
 
-    # ---- M = I + A*dt at the requested dt ---------------------------------
+    # ---- M = I - A*dt at the requested dt ---------------------------------
     M = build_M(A, args.dt)
     cond_M = condition_number(M)
     n_rows, n_cols = M.shape
     dense_size = n_rows * n_cols
     sparsity = 100.0 * (1.0 - M.nnz / dense_size) if dense_size else 100.0
 
-    print(f"\n=== M = I + A*dt  (dt = {args.dt:g}) ===")
-    print(f"shape     : {M.shape}")
-    print(f"nnz       : {M.nnz}  (sparsity {sparsity:.2f}%)")
-    print(f"cond_2(M) : {cond_M:.3e}")
-    print(f"||Y||_2   : {np.linalg.norm(Y):.3e}")
+    diag_M = M.diagonal()
+    print(f"\n=== M = I - A*dt  (dt = {args.dt:g}) ===")
+    print(f"shape        : {M.shape}")
+    print(f"nnz          : {M.nnz}  (sparsity {sparsity:.2f}%)")
+    print(f"cond_2(M)    : {cond_M:.3e}")
+    print(f"min diag(M)  : {float(np.min(diag_M)):.3e}  "
+          f"(should be >= 1)")
+    print(f"max diag(M)  : {float(np.max(diag_M)):.3e}  "
+          f"(= 1 + max|A_ii|*dt)")
+    print(f"||Y||_2      : {np.linalg.norm(Y):.3e}")
 
     # ---- Save M, Y, index -------------------------------------------------
     out_dir = args.out_prefix.parent
@@ -173,32 +202,35 @@ def main(argv=None) -> None:
         json.dump({"nuclides": nuclide_order}, f, indent=2)
 
     # ---- dt sweep ---------------------------------------------------------
-    # Relative size of the A*dt perturbation, ||A*dt||_F / ||I||_F, is a
-    # quick guide to which regime we're in: << 1 -> M ~= I, >> 1 -> M ~= A*dt.
+    # M = I - A*dt has diagonal 1 + |A_ii|*dt, so large dt produces a
+    # diagonally dominant (and hence well-conditioned) M. The small-dt end
+    # is the *interesting* one: M ~= I still, but any ill-conditioning of A
+    # shows up clearly when we push dt large enough to see it.
     norm_A = sp.linalg.norm(A, "fro")
     norm_I = float(np.sqrt(M.shape[0]))
 
-    print("\n=== Conditioning vs. dt (M = I + A*dt) ===")
-    print(f"{'dt':>12s}   {'cond_2(M)':>14s}   {'||A*dt||_F / ||I||_F':>22s}   regime")
-    print("-" * 82)
+    print("\n=== Conditioning vs. dt (M = I - A*dt) ===")
+    print(f"{'dt':>12s}   {'cond_2(M)':>14s}   {'min diag(M)':>14s}   "
+          f"{'max diag(M)':>14s}   {'||A*dt||_F / ||I||_F':>22s}")
+    print("-" * 96)
     for dt in (1.0e-6, 1.0e-3, 1.0):
         M_dt = build_M(A, dt)
         c = condition_number(M_dt)
         ratio = (norm_A * dt) / norm_I
-        if ratio < 0.1:
-            regime = "M ~= I"
-        elif ratio > 10.0:
-            regime = "M ~= A*dt"
-        else:
-            regime = "transition"
-        print(f"{dt:>12.0e}   {c:>14.3e}   {ratio:>22.3e}   {regime}")
+        d = M_dt.diagonal()
+        print(f"{dt:>12.0e}   {c:>14.3e}   {float(np.min(d)):>14.3e}   "
+              f"{float(np.max(d)):>14.3e}   {ratio:>22.3e}")
     cond_A = condition_number(A) if A.nnz else float("inf")
     print(f"\nReference : ||A||_F    = {norm_A:.3e}")
-    print(f"            cond_2(A) = {cond_A:.3e}  "
-          f"(A is rank-deficient from conservation; finite value is a "
-          f"floating-point artifact of the SVD)")
-    print("Observation: cond_2(M) scales ~linearly with dt in this regime, "
-          "consistent with M = I + A*dt being dominated by A*dt.")
+    print(f"            cond_2(A) = {cond_A:.3e}")
+    print("Observation: backward Euler gives diag(M) = 1 + |A_ii|*dt > 0, so "
+          "rows with large |A_ii| become diagonally dominant as dt grows. "
+          "But at equilibrium some |A_ii| are ~0 (forward/reverse cancel) "
+          "with large off-diagonals, so those rows never dominate — and "
+          "cond_2(M) ends up scaling ~linearly with dt rather than "
+          "decreasing. The conservation-row trick (conservation.py) is the "
+          "structural fix; the sign correction here is necessary but not "
+          "sufficient.")
 
 
 if __name__ == "__main__":

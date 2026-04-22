@@ -668,23 +668,37 @@ def _(mo):
         Coming back to this a few weeks later: I've been thinking about the
         rank-deficiency problem from the other direction. Instead of solving
         $A y = b$ directly, I discretize the rate equation $dY/dt = A\,Y$ with
-        backward Euler and solve the *timestep* system
+        backward Euler:
 
         $$
-        (I + A\,\Delta t)\,Y(t + \Delta t) = Y(t),
+        Y^{n+1} - Y^n = \Delta t \, A \, Y^{n+1}
+        \;\;\Longrightarrow\;\;
+        (I - A\,\Delta t)\, Y^{n+1} = Y^n.
         $$
 
-        which the professor writes as $M\,Y(t+\Delta t) = Y(t)$ with
-        $M = I + A\,\Delta t$. The diagonal gets an extra $+1$ from $I$, so for
-        small $\Delta t$ the matrix is essentially the identity and trivially
-        invertible; as $\Delta t$ grows, $A\,\Delta t$ takes over and $M$
-        inherits $A$'s pathologies. The RHS is just the current state vector
-        $Y(t)$ — no flow-accumulation gymnastics.
+        **Sign convention.** This caught me out the first time. `wnnet`'s rate
+        matrix $A$ uses *negative* diagonals (depletion — each species subtracts
+        itself as a self-loop). Backward Euler on $\dot Y = A\,Y$ therefore
+        gives $M = I - A\,\Delta t$ with diagonal
+        $M_{ii} = 1 - A_{ii}\Delta t = 1 + |A_{ii}|\,\Delta t > 0$, and that
+        diagonal *grows* with $\Delta t$. The professor works in the opposite
+        sign convention ($A_{\mathrm{prof}} = -A_{\mathrm{wnnet}}$, positive
+        diagonal), so his $M = I + A_{\mathrm{prof}}\Delta t$ is the same
+        operator — I just translate between conventions at the boundary.
+
+        The consequence is that *backward Euler is well-conditioned at large
+        $\Delta t$*, not poorly conditioned: the $+|A_{ii}|\Delta t$ on the
+        diagonal dominates the off-diagonal $-A_{ij}\Delta t$ terms. The
+        interesting regime — and the one that'll motivate section 9 — is the
+        opposite: when $A$ itself is near-singular (for instance near
+        equilibrium, where forward and reverse link flows cancel in the
+        accumulation), no amount of diagonal boost can rescue the problem
+        without a structural fix.
 
         For the state $Y(t)$ I use the nuclear statistical equilibrium
         abundances from `wneq` at the same $(T_9, \rho)$ — that's what we
-        expect the network to relax to, so testing the timestep system there
-        is a meaningful stress test.
+        expect the network to relax to, and sitting exactly there is the
+        meanest stress test I can set up for the formulation.
         """
     )
     return
@@ -756,7 +770,7 @@ def _(A_eq, dt_slider, mo, np, nuclide_order_eq, plt, sp):
     fig_euler, ax_euler = plt.subplots(figsize=(8, 8))
     ax_euler.spy(M, markersize=4, color="darkgreen")
     ax_euler.set_title(
-        f"M = I + A·Δt sparsity  (Δt = {dt:g}, nnz = {M.nnz})"
+        f"M = I - A·Δt sparsity  (Δt = {dt:g}, nnz = {M.nnz})"
     )
     ax_euler.set_xlabel("column (source nuclide)")
     ax_euler.set_ylabel("row (target nuclide)")
@@ -767,6 +781,10 @@ def _(A_eq, dt_slider, mo, np, nuclide_order_eq, plt, sp):
         ax_euler.set_yticklabels(nuclide_order_eq, fontsize=6)
     fig_euler.tight_layout()
 
+    diag_M = M.diagonal()
+    min_diag = float(np.min(diag_M))
+    max_diag = float(np.max(diag_M))
+
     mo.vstack([
         mo.md(f"""
 | Quantity | Value |
@@ -775,20 +793,28 @@ def _(A_eq, dt_slider, mo, np, nuclide_order_eq, plt, sp):
 | M shape | {M.shape[0]} × {M.shape[1]} |
 | nnz(M) | {M.nnz} |
 | $\\kappa_2(M)$ | {cond_M:.3e} |
+| min diag(M) = $1 + \\min_i |A_{{ii}}|\\Delta t$ | {min_diag:.3e} |
+| max diag(M) = $1 + \\max_i |A_{{ii}}|\\Delta t$ | {max_diag:.3e} |
 | $\\|A\\Delta t\\|_F / \\|I\\|_F$ | {regime_ratio:.3e} |
-| Regime | {"M ≈ I" if regime_ratio < 0.1 else "M ≈ A·Δt" if regime_ratio > 10 else "transition"} |
 """),
         fig_euler,
         mo.md(
-            "Sliding Δt from $10^{-6}$ up to $10^1$, I watch $\\kappa_2(M)$ "
-            "climb by many orders of magnitude. Even at the smallest Δt on "
-            "this slider, the perturbation $A\\,\\Delta t$ is already much "
-            "larger than $I$ in Frobenius norm — our $A$ entries are huge "
-            "(reaction rates in raw units), so the identity regime sits at "
-            "physically irrelevant Δt values. The interesting middle is "
-            "where Δt is around $10^{-14}$, but that's not useful for actual "
-            "timestepping. This is a hint we should non-dimensionalize $A$ "
-            "at some point."
+            "What I *expected* after fixing the sign: as Δt grows, the "
+            "diagonal $1 + |A_{ii}|\\,\\Delta t$ swamps the off-diagonal "
+            "$-A_{ij}\\,\\Delta t$ and $\\kappa_2(M)$ drops, because backward "
+            "Euler is supposed to be unconditionally stable and get easier "
+            "to solve at larger step sizes. What I actually *see*: "
+            "$\\kappa_2(M)$ grows about linearly with Δt — the same way it "
+            "did before the sign fix. The reason is specific to this $A$: "
+            "at equilibrium the diagonals $|A_{ii}|$ span **16 orders of "
+            "magnitude**, with two rows at $|A_{ii}| = 0$ exactly "
+            "(full forward/reverse cancellation for those species). At "
+            "dt = 1 only 17 of 30 rows are strictly diagonally dominant; "
+            "the 13 where the tiny diagonal meets large off-diagonal flows "
+            "are what holds $\\kappa_2(M)$ high. The sign fix didn't "
+            "rescue us from that — it just makes the formulation "
+            "mathematically correct. The structural fix is the "
+            "conservation row in the next section."
         ),
     ])
     return M, M_dense, cond_M, dt
@@ -994,14 +1020,18 @@ def _(mo):
         ---
         ## 10. Convergence Near Equilibrium
 
-        The pessimistic test: fix Δt = 1.0 (the A·Δt-dominated regime) and
-        sweep $T_9$ across 20 log-spaced points from 0.5 to 10. At each
-        point I compute the equilibrium abundances, rebuild $A_{\mathrm{eq}}$
-        and $M$, find the best α for the conservation row, and run all four
-        solver configurations (BiCGSTAB / GMRES × unmodified / modified).
-        This is the regime where the solvers actually struggle — which is
-        the point. I want to see whether the conservation row buys us
-        robustness across the whole temperature range.
+        With the sign fixed, Δt is no longer the hard knob — $M = I - A\,\Delta t$
+        is diagonally dominant and well-conditioned at large Δt. The real
+        difficulty comes from $A$ itself being nearly singular at equilibrium,
+        which is exactly the state we're evaluating at (Y_eq from wneq). So I
+        keep Δt = 1.0 and sweep $T_9$ across 20 log-spaced points from 0.5 to
+        10 instead. At each $T_9$ I rebuild the equilibrium composition,
+        assemble $A_{\mathrm{eq}}$ and $M$, find the best α for the
+        conservation row, and run all four solver configurations
+        (BiCGSTAB / GMRES × unmodified / with conservation row). The
+        question the plots below try to answer: does the conservation row
+        buy robustness across the temperature range where $A$ is
+        near-singular in different, temperature-dependent ways?
 
         The sweep below takes roughly 30–60 seconds on first load because it
         rebuilds everything per $T_9$ point. Marimo caches it afterwards, so
@@ -1261,17 +1291,19 @@ def _(mo, plt, sweep, t9_probe):
 def _(mo):
     mo.md(
         r"""
-        Moving the slider from low $T_9$ to high $T_9$, the condition number
-        of the unmodified $M$ climbs several orders of magnitude — which is
-        really just the condition number of $A$ leaking through, since at
-        $\Delta t = 1$ we're firmly in the $A\,\Delta t$-dominated regime.
-        The conservation-row variant tracks closely on the condition axis
-        but the solvers on $M_{\mathrm{mod}}$ are noticeably more robust, and
-        GMRES with the conservation row converges across a much larger swath
-        of the temperature range than any other configuration. That matches
-        what we want from this formulation: the row replacement doesn't
-        magically shrink the condition number, but it swaps a near-singular
-        row for a well-scaled linear constraint that iterative solvers can
+        Moving the slider from low $T_9$ to high $T_9$ sweeps through a
+        sequence of equilibrium states where $A$'s near-singularity shows
+        up in different ways. In the sweep I ran with the corrected sign,
+        cond₂(M) ranges from ~$10^{14}$ at $T_9 = 0.5$ up to ~$10^{19}$ at
+        $T_9 = 10$, dominated by a handful of rows where $|A_{ii}|$ has
+        cancelled to near zero while the off-diagonal flows remain large.
+        The conservation-row variant cuts cond₂ by a factor of ~2–5 at
+        most $T_9$ — not a huge absolute win on the SVD scale, but enough
+        of a structural improvement that GMRES with the conservation row
+        converges 13/20 times, BiCGSTAB with it converges 5/20, and the
+        unmodified formulations converge 0/20 and 1/20 respectively. The
+        row replacement doesn't fix the conditioning on the SVD scale;
+        it reshapes the problem into something Krylov iteration can
         actually make progress on.
         """
     )

@@ -9,7 +9,7 @@ the mass-conservation row augmentation from conservation.py.
 For each T9 point we:
   1. Compute equilibrium abundances Y_eq at (T9, rho) with wneq.
   2. Build A from the equilibrium composition (build_A_matrix) and
-     assemble M = I + A*dt (build_M).
+     assemble M = I - A*dt (build_M, backward Euler).
   3. Find the alpha that minimizes cond_2 of the conservation-augmented
      matrix (find_best_alpha from conservation.py) and build M_mod.
   4. Solve M y = Y_eq with BiCGSTAB and GMRES(30).
@@ -22,10 +22,17 @@ Three log-log plots are written to output/:
     convergence_iterations.pdf   iters  vs T9 (4 configs)
     convergence_residual.pdf     ||Ax-b||/||b|| vs T9 (4 configs)
 
-The default dt = 1.0 is the hard regime: A*dt dominates over I and
-the matrix is severely ill-conditioned, so iterative solvers are
-expected to struggle without preconditioning. That is the point of
-the study.
+With the correct backward-Euler sign, *in principle* large dt should
+make M diagonally dominant and well-conditioned. In practice, because
+the equilibrium A has a few rows with near-zero diagonal (flow
+cancellation) mixed with rows where |A_ii| is enormous, M is never
+uniformly diagonally dominant and cond_2(M) still scales roughly
+linearly with dt in our numbers. The sign fix is mathematically
+necessary but doesn't by itself fix the conditioning -- the structural
+fix is the conservation-row augmentation. The T9 sweep exercises
+proximity to equilibrium (the state used at every point is Y_eq from
+wneq), so it's the right lens for seeing when the conservation row
+actually earns its keep.
 """
 
 import argparse
@@ -123,8 +130,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                     "M = I + A*dt with and without mass-conservation row."
     )
     p.add_argument("--dt", type=float, default=1.0,
-                   help="Timestep for M = I + A*dt (default: 1.0, the "
-                        "A*dt-dominated hard regime).")
+                   help="Timestep for M = I - A*dt (default: 1.0). At this "
+                        "scale M is diagonally dominant; hard-ness comes "
+                        "from near-equilibrium singularity of A itself.")
     p.add_argument("--rho", type=float, default=1.0e6,
                    help="Mass density in g/cm^3 (default: 1e6).")
     p.add_argument("--tol", type=float, default=1.0e-10,

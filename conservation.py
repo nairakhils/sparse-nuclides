@@ -5,9 +5,10 @@ conservation.py
 Probe how enforcing mass conservation in the implicit Euler system
 affects its conditioning.
 
-Starting from M = I + A*dt (built exactly as build_euler_system.py does,
-with equilibrium abundances Y as the state) we replace the LAST row of
-the system with a scaled mass-conservation constraint:
+Starting from M = I - A*dt (backward Euler, built exactly as
+build_euler_system.py does, with equilibrium abundances Y as the state)
+we replace the LAST row of the system with a scaled mass-conservation
+constraint:
 
     M[-1, :]  <- alpha * [A_1, A_2, ..., A_N]
     b[-1]     <- alpha * sum_i A_i * Y_i   (= alpha, since mass is
