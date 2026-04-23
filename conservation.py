@@ -92,7 +92,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--rho", type=float, default=1.0e6,
                    help="Mass density in g/cm^3 (default: 1e6).")
     p.add_argument("--dt", type=float, default=1.0e-3,
-                   help="Timestep for M = I + A*dt (default: 1e-3).")
+                   help="Timestep for M = I - A*dt (default: 1e-3).")
     return p.parse_args(argv)
 
 
@@ -114,7 +114,7 @@ def main(argv=None) -> None:
     A = build_A_matrix(link_flows, nuclide_order)
     M = build_M(A, args.dt)
     print(f"  A: shape={A.shape}, nnz={A.nnz}")
-    print(f"  M = I + A*dt (dt={args.dt:g}), nnz={M.nnz}")
+    print(f"  M = I - A*dt (dt={args.dt:g}), nnz={M.nnz}")
 
     # ---- Mass-number vector and conservation-constraint RHS ---------------
     A_vec = np.array(

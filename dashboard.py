@@ -742,13 +742,50 @@ rank defect from unseeded rows.
 
 
 @app.cell
+def _(A_eq, Y_eq, mo, np, sp):
+    _AY_eq = A_eq @ Y_eq
+    _res_abs = float(np.linalg.norm(_AY_eq))
+    _denom = float(sp.linalg.norm(A_eq, "fro")) * float(np.linalg.norm(Y_eq))
+    _res_rel = _res_abs / _denom if _denom > 0 else float("inf")
+
+    _table = mo.md(f"""
+**Equilibrium consistency check — is $Y_{{\\mathrm{{eq}}}}$ a null vector of $A_{{\\mathrm{{eq}}}}$?**
+
+| Quantity | Value |
+|----------|-------|
+| $\\|A\\,Y_{{\\mathrm{{eq}}}}\\|_2$ | **{_res_abs:.3e}** |
+| $\\|A\\,Y_{{\\mathrm{{eq}}}}\\|_2 \\;/\\; (\\|A\\|_F\\,\\|Y_{{\\mathrm{{eq}}}}\\|_2)$ | **{_res_rel:.3e}** |
+
+At true detailed balance this relative residual should be $\\sim 10^{{-8}}$
+or smaller. If it is $O(1)$, the wneq equilibrium and the wnnet rate
+matrix are not actually evaluating to the same fixed point.
+""")
+
+    _warn = mo.callout(
+        mo.md(
+            "**Inconsistency flag.** The relative residual is well above "
+            "double-precision roundoff. The equilibrium state and the "
+            "rate matrix may not be consistent — possibly different "
+            "treatments of weak reactions, or `wneq` enforcing detailed "
+            "balance that `wnnet`'s $A$ does not enforce at that level. "
+            "Read the dashboard's near-equilibrium claims with that in "
+            "mind."
+        ),
+        kind="warn",
+    ) if _res_rel > 1e-4 else None
+
+    mo.vstack([_table, _warn]) if _warn is not None else _table
+    return
+
+
+@app.cell
 def _(mo):
     dt_slider = mo.ui.slider(
         start=-6.0, stop=1.0, step=0.5, value=-3.0,
         label="log₁₀(Δt)", show_value=True,
     )
     mo.vstack([
-        mo.md("**Δt** (timestep for M = I + A·Δt). Slider is log-scaled."),
+        mo.md("**Δt** (timestep for M = I - A·Δt). Slider is log-scaled."),
         dt_slider,
     ])
     return (dt_slider,)
@@ -1020,22 +1057,33 @@ def _(mo):
         ---
         ## 10. Convergence Near Equilibrium
 
-        With the sign fixed, Δt is no longer the hard knob — $M = I - A\,\Delta t$
-        is diagonally dominant and well-conditioned at large Δt. The real
-        difficulty comes from $A$ itself being nearly singular at equilibrium,
-        which is exactly the state we're evaluating at (Y_eq from wneq). So I
-        keep Δt = 1.0 and sweep $T_9$ across 20 log-spaced points from 0.5 to
-        10 instead. At each $T_9$ I rebuild the equilibrium composition,
-        assemble $A_{\mathrm{eq}}$ and $M$, find the best α for the
-        conservation row, and run all four solver configurations
-        (BiCGSTAB / GMRES × unmodified / with conservation row). The
-        question the plots below try to answer: does the conservation row
-        buy robustness across the temperature range where $A$ is
-        near-singular in different, temperature-dependent ways?
+        Section 8 already showed that the sign fix alone doesn't tame the
+        problem at large $\Delta t$: at equilibrium some rows of $A$ have
+        $|A_{ii}| \approx 0$ (forward and reverse flows cancel), and no
+        amount of diagonal boost from $\Delta t$ rescues those rows —
+        $\kappa_2(M)$ ends up scaling roughly *linearly* with $\Delta t$
+        rather than decreasing. So $\Delta t$ isn't a free knob.
 
-        The sweep below takes roughly 30–60 seconds on first load because it
-        rebuilds everything per $T_9$ point. Marimo caches it afterwards, so
-        the slider at the bottom responds instantly.
+        The axis I haven't varied yet is temperature. Different $T_9$ give
+        different equilibrium compositions, which means a different set of
+        reactions is the one cancelling at the diagonal, and the
+        near-singularity of $A$ shows up in temperature-dependent ways.
+        The question I want to answer here: does the conservation-row
+        trick hold up across the full temperature range, or is the
+        $T_9 = 3$ case I've been staring at quietly easier than the
+        regimes either side of it?
+
+        I keep $\Delta t = 1.0$ fixed (so the sign fix is acting at full
+        strength and any failure has to come from $A$, not from the time
+        discretization) and sweep $T_9$ across 20 log-spaced points from
+        0.5 to 10. At each $T_9$ I rebuild the equilibrium composition,
+        assemble $A_{\mathrm{eq}}$ and $M$, find the best $\alpha$ for
+        the conservation row, and run all four solver configurations
+        (BiCGSTAB / GMRES × unmodified / with conservation row).
+
+        The sweep below takes roughly 30–60 seconds on first load because
+        it rebuilds everything per $T_9$ point. Marimo caches it
+        afterwards, so the slider at the bottom responds instantly.
         """
     )
     return
@@ -1288,24 +1336,36 @@ def _(mo, plt, sweep, t9_probe):
 
 
 @app.cell
-def _(mo):
+def _(mo, np, sweep):
+    _t9_arr = sweep["t9_grid"]
+    _cu = sweep["cond_unmod"]
+    _cm = sweep["cond_mod"]
+    _conv = sweep["conv"]
+    _n = len(_t9_arr)
+    _ratio_med = float(np.nanmedian(_cu / _cm))
+    _conv_bu = int(_conv["bicg_unmod"].sum())
+    _conv_gu = int(_conv["gmres_unmod"].sum())
+    _conv_bm = int(_conv["bicg_mod"].sum())
+    _conv_gm = int(_conv["gmres_mod"].sum())
+
     mo.md(
-        r"""
-        Moving the slider from low $T_9$ to high $T_9$ sweeps through a
-        sequence of equilibrium states where $A$'s near-singularity shows
-        up in different ways. In the sweep I ran with the corrected sign,
-        cond₂(M) ranges from ~$10^{14}$ at $T_9 = 0.5$ up to ~$10^{19}$ at
-        $T_9 = 10$, dominated by a handful of rows where $|A_{ii}|$ has
-        cancelled to near zero while the off-diagonal flows remain large.
-        The conservation-row variant cuts cond₂ by a factor of ~2–5 at
-        most $T_9$ — not a huge absolute win on the SVD scale, but enough
-        of a structural improvement that GMRES with the conservation row
-        converges 13/20 times, BiCGSTAB with it converges 5/20, and the
-        unmodified formulations converge 0/20 and 1/20 respectively. The
-        row replacement doesn't fix the conditioning on the SVD scale;
-        it reshapes the problem into something Krylov iteration can
-        actually make progress on.
-        """
+        f"""
+Moving the slider from low $T_9$ to high $T_9$ sweeps through a
+sequence of equilibrium states where $A$'s near-singularity shows
+up in different ways. In this sweep with the corrected sign,
+$\\kappa_2(M)$ ranges from $\\sim${_cu[0]:.1e} at $T_9 = {_t9_arr[0]:.2f}$
+up to $\\sim${_cu[-1]:.1e} at $T_9 = {_t9_arr[-1]:.2f}$, dominated by a
+handful of rows where $|A_{{ii}}|$ has cancelled to near zero while
+the off-diagonal flows remain large. The conservation-row variant
+cuts $\\kappa_2$ by a median factor of {_ratio_med:.1f}× across the
+sweep — not a huge absolute win on the SVD scale, but enough of a
+structural improvement that GMRES with the conservation row
+converges {_conv_gm}/{_n} times and BiCGSTAB with it converges
+{_conv_bm}/{_n}; without the row, BiCGSTAB converges {_conv_bu}/{_n}
+and GMRES converges {_conv_gu}/{_n}. The row replacement doesn't fix
+the conditioning on the SVD scale; it reshapes the problem into
+something Krylov iteration can actually make progress on.
+"""
     )
     return
 

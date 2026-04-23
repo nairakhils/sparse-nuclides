@@ -83,14 +83,18 @@ def composition_from_Y(
     for i, name in enumerate(nuclide_order):
         info = nuclide_info[name]
         x = info["a"] * float(Y[i])
-        if x > 0.0:
+        # Filtering x > 0.0 used to drop species wneq returned as exactly
+        # 0.0 (underflow on tiny X), which silently changed which reactions
+        # wnnet saw and therefore changed A. 1e-300 still rejects NaN and
+        # negative roundoff but keeps every genuine wneq abundance.
+        if x > 1e-300:
             comp[(name, info["z"], info["a"])] = x
     return comp
 
 
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Build the implicit Euler matrix M = I + A*dt from the "
+        description="Build the implicit Euler matrix M = I - A*dt from the "
                     "webnucleo network, using Y_eq from wneq as the RHS state."
     )
     p.add_argument(
@@ -110,7 +114,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     p.add_argument(
         "--dt", type=float, default=1.0e-3,
-        help="Timestep for M = I + A*dt (default: 1e-3).",
+        help="Timestep for M = I - A*dt (default: 1e-3).",
     )
     p.add_argument(
         "--nuc-xpath", type=str, default="[z <= 8 and a <= 20]",
@@ -160,10 +164,24 @@ def main(argv=None) -> None:
 
     composition = composition_from_Y(Y, nuclide_order, nuclide_info)
     print(f"Computing link flows at the equilibrium composition "
-          f"({len(composition)} species with X > 0) ...")
+          f"({len(composition)} species with X > 1e-300) ...")
     link_flows = wflows.compute_link_flows(net, args.t9, args.rho, composition)
     A = build_A_matrix(link_flows, nuclide_order)
     print(f"  A: shape={A.shape}, nnz={A.nnz}")
+
+    # ---- Physics consistency: is Y_eq actually a null vector of A? -------
+    AY_eq = A @ Y
+    res_abs = float(np.linalg.norm(AY_eq))
+    denom = float(sp.linalg.norm(A, "fro")) * float(np.linalg.norm(Y))
+    res_rel = res_abs / denom if denom > 0 else float("inf")
+    print(f"\n=== Equilibrium consistency: A @ Y_eq ===")
+    print(f"||A @ Y_eq||_2                         : {res_abs:.3e}")
+    print(f"||A @ Y_eq|| / (||A||_F * ||Y_eq||_2)  : {res_rel:.3e}")
+    if res_rel > 1e-4:
+        print("  !! relative residual is well above roundoff -- the wneq")
+        print("  !! equilibrium state and the wnnet rate matrix may not be")
+        print("  !! consistent (different weak-reaction handling, or wneq")
+        print("  !! enforcing detailed balance that wnnet's A doesn't).")
 
     # ---- M = I - A*dt at the requested dt ---------------------------------
     M = build_M(A, args.dt)

@@ -127,7 +127,7 @@ def dense_to_csr_with_last_row(M_csr: sp.csr_matrix, last_row: np.ndarray) -> sp
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Sweep T9 and compare iterative-solver behavior on "
-                    "M = I + A*dt with and without mass-conservation row."
+                    "M = I - A*dt with and without mass-conservation row."
     )
     p.add_argument("--dt", type=float, default=1.0,
                    help="Timestep for M = I - A*dt (default: 1.0). At this "

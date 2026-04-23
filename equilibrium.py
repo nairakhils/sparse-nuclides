@@ -172,6 +172,37 @@ def main(argv=None) -> None:
     status = "OK" if abs(mass_eq - mass_seed) < tol else f"DRIFT > {tol:g}"
     print(f"status      : {status}")
 
+    # ---- Rate matrix residual at equilibrium -----------------------------
+    # Local imports: build_euler_system imports compute_equilibrium from
+    # this module at module load, so importing composition_from_Y at the
+    # top of equilibrium.py would create a circular import. By the time
+    # main() runs, both modules are fully loaded and a local import is
+    # safe.
+    import wnnet.net as _wnet
+    import wnnet.flows as _wflows
+    import scipy.sparse as _sp
+    from build_system import build_A_matrix
+    from build_euler_system import composition_from_Y
+
+    net = _wnet.Net(XML_PATH, nuc_xpath=NUC_XPATH, reac_xpath="")
+    comp = composition_from_Y(result.y_eq, nuclide_order, nuclide_info)
+    link_flows = _wflows.compute_link_flows(net, args.t9, args.rho, comp)
+    A = build_A_matrix(link_flows, nuclide_order)
+
+    AY_eq = A @ result.y_eq
+    res_abs = float(np.linalg.norm(AY_eq))
+    denom = float(_sp.linalg.norm(A, "fro")) * float(np.linalg.norm(result.y_eq))
+    res_rel = res_abs / denom if denom > 0 else float("inf")
+
+    print("\n=== Rate matrix residual at equilibrium ===")
+    print(f"||A @ Y_eq||_2                         : {res_abs:.3e}")
+    print(f"||A @ Y_eq|| / (||A||_F * ||Y_eq||_2)  : {res_rel:.3e}")
+    if res_rel > 1e-4:
+        print("  !! relative residual is well above roundoff -- the wneq")
+        print("  !! equilibrium state and the wnnet rate matrix may not be")
+        print("  !! consistent (different weak-reaction handling, or wneq")
+        print("  !! enforcing detailed balance that wnnet's A doesn't).")
+
 
 if __name__ == "__main__":
     main()
