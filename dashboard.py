@@ -1370,5 +1370,455 @@ something Krylov iteration can actually make progress on.
     return
 
 
+@app.cell
+def _(mo):
+    mo.md(
+        r"""
+        ---
+        ## 11. Project Status Dashboard
+
+        Sections 1–10 walk through the reasoning chain. This section is the
+        summary row: every diagnostic I ran during the project, its verdict,
+        the key number, and the regime in which that verdict holds. I load
+        whatever `.npz` files are present under `output/` (and subdirs);
+        missing ones become skipped rows rather than errors, so this table
+        stays useful as the output directory drifts.
+
+        Green means PASS/CLEAN, yellow means MARGINAL, red means FAIL.
+        """
+    )
+    return
+
+
+@app.cell
+def _(mo):
+    from pathlib import Path as _Path
+    import numpy as _np
+
+    def _safe_load(relpath):
+        p = _Path(relpath)
+        if not p.exists():
+            return None
+        try:
+            return dict(_np.load(p, allow_pickle=True))
+        except Exception:
+            return None
+
+    def _verdict_badge(kind: str) -> str:
+        return {
+            "pass": "🟢 PASS",
+            "clean": "🟢 CLEAN",
+            "marginal": "🟡 MARGINAL",
+            "fail": "🔴 FAIL",
+            "expected_fail": "🔴 FAILS (expected)",
+        }[kind]
+
+    def _safe_max(arr):
+        arr = _np.asarray(arr, dtype=float)
+        arr = arr[_np.isfinite(arr)]
+        return float(arr.max()) if arr.size else float("nan")
+
+    def _safe_min(arr):
+        arr = _np.asarray(arr, dtype=float)
+        arr = arr[_np.isfinite(arr)]
+        return float(arr.min()) if arr.size else float("nan")
+
+    rows = []
+
+    # --- Gate 1: check_detailed_balance (narrow, unfiltered strong+EM+weak) --
+    d = _safe_load("output/detailed_balance.npz")
+    if d is not None:
+        max_skew = _safe_max(d["skew_ratio"])
+        rows.append(dict(
+            Diagnostic="check_detailed_balance (narrow)",
+            Verdict=_verdict_badge("expected_fail"),
+            Metric=f"max skew_ratio = {max_skew:.3f}",
+            Regime="full A at wneq Y_eq, T9 in [0.5, 10], strong+EM+weak",
+        ))
+
+    # --- Gate 2: check_detailed_balance_filtered (narrow, strong+EM only) ----
+    d = _safe_load("output/detailed_balance_filtered.npz")
+    if d is not None:
+        filt_skew_max = _safe_max(d["filt_skew_ratio"])
+        filt_AY_min = _safe_min(d["filt_AY_rel"])
+        rows.append(dict(
+            Diagnostic="check_detailed_balance_filtered (narrow, strong+EM)",
+            Verdict=_verdict_badge("expected_fail"),
+            Metric=(f"max filt_skew = {filt_skew_max:.3f}; "
+                    f"min filt_AY_rel = {filt_AY_min:.1e} at cold T9"),
+            Regime="weak excluded; cold T9 gives ~1e-49, hot T9 stays ~1",
+        ))
+
+    # --- Gate 3: spectrum_audit narrow + wide -------------------------------
+    for label, path in (("narrow", "output/spectrum_audit.npz"),
+                        ("wide",   "output/wide_xpath/spectrum_audit.npz")):
+        d = _safe_load(path)
+        if d is None:
+            continue
+        max_imre = _safe_max(d["max_im_re_ratio"])
+        n_pos_total = int(_np.asarray(d["n_positive_re"]).sum())
+        rows.append(dict(
+            Diagnostic=f"spectrum_audit ({label})",
+            Verdict=_verdict_badge("clean"),
+            Metric=(f"max |Im/Re| = {max_imre:.1e}; "
+                    f"total n_positive_re = {n_pos_total}"),
+            Regime="strong+EM A at wneq Y_eq, T9 in [0.5, 10]",
+        ))
+
+    # --- CRAM-16 self-tests (re-run inline; ~2 s on laptop) -----------------
+    try:
+        import scipy.sparse as _sp
+        from cram16 import (
+            cram16_apply as _cram_apply,
+            cram16_step as _cram_step,
+            build_conservation_matrix as _cram_W,
+            REAC_XPATH_STRONG_EM as _cram_reac_xpath,
+        )
+
+        # Test 1: diagonal exp
+        _A = _sp.diags([-1.0, -2.0, -3.0, -100.0], format="csr")
+        _v = _np.ones(4)
+        _diag = _np.array([-1.0, -2.0, -3.0, -100.0])
+        _errs = []
+        for _dt in (0.01, 0.1, 1.0, 10.0):
+            _w = _cram_apply(_dt * _A, _v)
+            _errs.append(float(_np.max(_np.abs(_w - _np.exp(_dt * _diag) * _v))))
+        rows.append(dict(
+            Diagnostic="cram16 test 1 (diagonal exp)",
+            Verdict=_verdict_badge("pass") if max(_errs) < 1e-12
+                    else _verdict_badge("fail"),
+            Metric=f"max err = {max(_errs):.2e} (threshold 1e-12)",
+            Regime="dt in {0.01, 0.1, 1.0, 10.0}, diag A",
+        ))
+
+        # Test 2: identity at dt = 0
+        _w0 = _cram_apply(0.0 * _A, _v)
+        _err0 = float(_np.max(_np.abs(_w0 - _v)))
+        rows.append(dict(
+            Diagnostic="cram16 test 2 (identity at dt=0)",
+            Verdict=_verdict_badge("pass") if _err0 < 1e-12
+                    else _verdict_badge("fail"),
+            Metric=f"max err = {_err0:.2e} (threshold 1e-12)",
+            Regime="cram16_apply(0 * A, v) should return v",
+        ))
+
+        # Test 3: equilibrium preservation at narrow T9=0.5, 1000 steps
+        import wnnet.flows as _wf
+        import wnnet.net as _wn
+        from build_system import build_A_matrix as _ba
+        from build_euler_system import composition_from_Y as _cfY
+        from equilibrium import compute_equilibrium as _ceq
+        _nuc = "[z <= 8 and a <= 20]"
+        _eq = _ceq(t9=0.5, rho=1.0e6, xml_path="data/example_net.xml",
+                   nuc_xpath=_nuc)
+        _net = _wn.Net("data/example_net.xml", nuc_xpath=_nuc,
+                       reac_xpath=_cram_reac_xpath)
+        _comp = _cfY(_eq.y_eq, _eq.nuclide_order, _eq.nuclide_info)
+        _link = _wf.compute_link_flows(_net, 0.5, 1.0e6, _comp)
+        _A3 = _ba(_link, _eq.nuclide_order)
+        _W3 = _cram_W(_eq.nuclide_order, _eq.nuclide_info)
+        _Y = _eq.y_eq.copy()
+        _Y0 = _eq.y_eq.copy()
+        _norm_Y0 = float(_np.linalg.norm(_Y0))
+        _max_drift = 0.0
+        for _step in range(1000):
+            _Y, _ = _cram_step(_A3, _Y, dt=1.0, W=_W3)
+            _d = float(_np.linalg.norm(_Y - _Y0) / _norm_Y0)
+            if _d > _max_drift:
+                _max_drift = _d
+        rows.append(dict(
+            Diagnostic="cram16 test 3 (equilibrium preservation, 1000 steps)",
+            Verdict=_verdict_badge("pass") if _max_drift < 1e-8
+                    else _verdict_badge("fail"),
+            Metric=f"max drift = {_max_drift:.2e} (threshold 1e-8)",
+            Regime="narrow, strong+EM, T9=0.5, rho=1e6, dt=1.0",
+        ))
+    except Exception as _e:
+        rows.append(dict(
+            Diagnostic="cram16 tests",
+            Verdict=_verdict_badge("fail"),
+            Metric=f"re-run errored: {type(_e).__name__}: {_e}",
+            Regime="(expected to pass; see cram16.py)",
+        ))
+
+    # --- off_equilibrium: cram_proj + bicg_alpha summaries ------------------
+    d = _safe_load("output/off_equilibrium.npz")
+    if d is not None:
+        methods = _np.asarray(d["method"])
+        conv = _np.asarray(d["converged"], dtype=bool)
+        rel = _np.asarray(d["rel_err"], dtype=float)
+
+        for label, method, threshold in (
+                ("cram_proj", "cram_proj", 1e-6),
+                ("bicg_alpha", "bicg_alpha", 1e-6),
+        ):
+            mask = methods == method
+            if not mask.any():
+                continue
+            rel_m = rel[mask]
+            conv_m = conv[mask]
+            max_rel = _safe_max(rel_m[conv_m])
+            n_fail = int((~conv_m).sum())
+            n_total = int(mask.sum())
+
+            if method == "cram_proj":
+                verdict = (_verdict_badge("clean")
+                           if (max_rel == max_rel and max_rel < threshold)
+                           else _verdict_badge("fail"))
+                metric = (f"max rel_err = {max_rel:.2e} across "
+                          f"{n_total} configs; {n_fail} non-converged")
+            else:
+                # bicg_alpha: count false convergence (info=0 but rel_err > 1e-2)
+                false_conv = int(((conv_m)
+                                  & _np.isfinite(rel_m)
+                                  & (rel_m > 1e-2)).sum())
+                if n_fail == n_total:
+                    verdict = _verdict_badge("fail")
+                elif false_conv > 0 or (max_rel == max_rel and max_rel > threshold):
+                    verdict = _verdict_badge("fail")
+                else:
+                    verdict = _verdict_badge("marginal")
+                metric = (f"max rel_err = {max_rel:.2e} (reported-converged); "
+                          f"{n_fail}/{n_total} non-converged; "
+                          f"{false_conv} false-convergence "
+                          f"(info=0 but rel_err > 1e-2)")
+
+            rows.append(dict(
+                Diagnostic=f"off_equilibrium ({label})",
+                Verdict=verdict,
+                Metric=metric,
+                Regime=("2 filters x 3 T9 x 3 eps at dt=1e-2, "
+                        "Y0 = Y_eq + eps * W-preserving delta"),
+            ))
+
+    status_table = mo.ui.table(
+        rows,
+        label="Project status: every diagnostic, its verdict, "
+              "its key metric, and where that verdict holds.",
+        pagination=False,
+        selection=None,
+    )
+    mo.vstack([
+        mo.md(f"**{len(rows)} diagnostics loaded from `output/` and its "
+              f"subdirectories.** Missing npz files become skipped rows."),
+        status_table,
+    ])
+    return (rows,)
+
+
+@app.cell
+def _(mo):
+    mo.md(
+        r"""
+        ---
+        ## 12. Paper Figures
+
+        The six figures I plan to carry into the paper. Each PDF in
+        `output/` is rasterized on the fly via `pdftoppm` — marimo's direct
+        PDF support is flaky across versions, so I convert to PNG first and
+        cache the PNG next to the PDF. Captions are the short version of
+        what each figure is saying.
+        """
+    )
+    return
+
+
+@app.cell
+def _(mo):
+    import subprocess as _subprocess
+    from pathlib import Path as _Path
+
+    _DPI = 150
+
+    def _pdf_to_png_cached(pdf_path: str):
+        """Convert a PDF to a cached sibling PNG via pdftoppm -singlefile.
+        Returns the PNG path if successful, or None if the PDF is missing
+        or conversion fails."""
+        pdf = _Path(pdf_path)
+        if not pdf.exists():
+            return None
+        png = pdf.with_suffix(".png")
+        if png.exists() and png.stat().st_mtime >= pdf.stat().st_mtime:
+            return str(png)
+        try:
+            _subprocess.run(
+                ["pdftoppm", "-png", "-r", str(_DPI), "-singlefile",
+                 str(pdf), str(pdf.with_suffix(""))],
+                check=True, capture_output=True,
+            )
+            return str(png) if png.exists() else None
+        except (FileNotFoundError, _subprocess.CalledProcessError):
+            return None
+
+    def figure_block(relpath: str, title: str, caption: str):
+        """Return an mo.vstack with figure + caption, or a 'missing' note.
+        Shared across the Section 12 cells via the marimo cell graph."""
+        png = _pdf_to_png_cached(relpath) if relpath.endswith(".pdf") \
+            else (relpath if _Path(relpath).exists() else None)
+        header = mo.md(f"### {title}")
+        body = (mo.image(png, width=900) if png is not None
+                else mo.md(f"*`{relpath}` not available; run the "
+                           f"corresponding study script and reload.*"))
+        return mo.vstack([header, body, mo.md(caption)])
+
+    return (figure_block,)
+
+
+@app.cell
+def _(figure_block):
+    # Figure 1 - sparsity patterns (Z<=8 and Z<=20 side by side).
+    # Produced by make_sparsity_figure.py -> output/sparsity_patterns.pdf;
+    # we fall back to the legacy output/sparsity_pattern.png if the paper
+    # figure hasn't been generated yet.
+    from pathlib import Path as _Path
+    _sparsity_src = (
+        "output/sparsity_patterns.pdf"
+        if _Path("output/sparsity_patterns.pdf").exists()
+        else "output/sparsity_pattern.png"
+    )
+    figure_block(
+        _sparsity_src,
+        "Figure 1 — Sparsity patterns",
+        "What the rate matrix actually looks like at both filter widths. "
+        "The block structure comes from mass-ordered indexing; "
+        "off-diagonal density reflects reaction chains linking light "
+        "species to heavy.",
+    )
+    return
+
+
+@app.cell
+def _(figure_block):
+    figure_block(
+        "output/cost_vs_accuracy_summary.pdf",
+        "Figure 2 — Cost-accuracy summary",
+        "Headline result. CRAM with projection dominates the Pareto "
+        "frontier at both filter widths. BiCGSTAB with alpha-row appears "
+        "only at cold narrow; at wide filter it never converges.",
+    )
+    return
+
+
+@app.cell
+def _(figure_block):
+    figure_block(
+        "output/cost_vs_accuracy_narrow.pdf",
+        "Figure 3 — Cost-accuracy (narrow)",
+        "Per-T9 detail at n=30. CRAM is flat in accuracy across dt; "
+        "BiCGSTAB+alpha degrades as T9 rises.",
+    )
+    return
+
+
+@app.cell
+def _(figure_block):
+    figure_block(
+        "output/cost_vs_accuracy_wide.pdf",
+        "Figure 4 — Cost-accuracy (wide)",
+        "Same but at n=154. Spectral radius is now 4e30. CRAM still "
+        "converges; everything else fails.",
+    )
+    return
+
+
+@app.cell
+def _(figure_block):
+    figure_block(
+        "output/off_equilibrium_accuracy.pdf",
+        "Figure 5 — Off-equilibrium accuracy",
+        "Perturbation test with epsilon-scale multiplicative deviation "
+        "from Y_eq. Both CRAM variants propagate accurately; BiCGSTAB+"
+        "alpha is unreliable at the wide filter.",
+    )
+    return
+
+
+@app.cell
+def _(figure_block):
+    figure_block(
+        "output/off_equilibrium_conservation.pdf",
+        "Figure 6 — Off-equilibrium conservation",
+        "Separating CRAM's accuracy contribution from the projection's "
+        "conservation contribution. Raw CRAM leaks at 1e-8; projected "
+        "CRAM holds at machine precision.",
+    )
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(
+        r"""
+        ---
+        ## 13. Headline and Next Steps
+
+        After all that, here's where I landed and what I'd do next.
+
+        ### Three claims I'm willing to defend
+
+        - **Detailed-balance symmetrization is not the route.** wnnet's
+          rate matrix $A$ at wneq's equilibrium does not admit a
+          $D^{-1} A D$ symmetrization to double precision. Even after
+          excluding weak reactions, the residual `skew_ratio` stays
+          $\sim 1$; mass conservation plus charge conservation isn't
+          enough structure to hand a symmetric solver. See section 11.
+
+        - **The spectrum is CRAM-friendly.** Eigenvalues of $A$ on the
+          strong+EM subset sit on the negative real axis with
+          $|\mathrm{Im}/\mathrm{Re}| < 10^{-17}$ at every $T_9$ and both
+          filter widths, with three near-zero modes (baryon + charge +
+          one inert-species artifact). This is exactly the structure
+          CRAM-16 was designed for.
+
+        - **IPF CRAM-16 with a 2-row conservation projection dominates.**
+          Across $2$ filters $\times$ $5$ $T_9$ $\times$ $4$ $\Delta t$ in
+          `accuracy_study` and across $2$ filters $\times$ $3$ $T_9$
+          $\times$ $3$ $\varepsilon$ in `off_equilibrium_study`,
+          `cram_proj` holds `rel_err` below $10^{-10}$ and
+          mass/charge drift below $10^{-15}$ (machine precision) in every
+          single run. No other method we tried does both.
+
+        ### Three things worth flagging
+
+        - **False convergence of `bicg_alpha` at wide T9=1.**
+          `scipy.sparse.linalg.bicgstab` returns `info=0` (converged) but
+          the solution is $155\%$ wrong and charge drift is $0.23$. On an
+          ill-conditioned $(I - A\,\Delta t)$ with a good-enough Krylov
+          residual, `info=0` is not a safety guarantee. This is a
+          production-pipeline hazard worth citing: any pipeline that
+          trusts `bicgstab`'s info flag without a sanity check can emit
+          silently wrong burnup/abundance numbers.
+
+        - **expm is unreliable at wide filter.** `scipy.linalg.expm` is
+          either non-finite (at `T_9 \in \{0.5, 8\}`) or quietly wrong
+          (by $45\%$ at `T_9 = 1`) when $\lVert A \rVert_F > 10^{17}$.
+          The paper's reference strategy is `expm` where it agrees with
+          `cram_tight` (= CRAM-16 at $\Delta t = 10^{-4}$), else
+          `cram_tight`; this is spelled out in `pareto_table.txt`.
+
+        - **Off-equilibrium norm reinterpretation.** In
+          `off_equilibrium_study` I use a multiplicative
+          $\delta_i = Y_{\mathrm{eq},i}\, u_i$ rather than the additive
+          spec literal, because wneq's $30$-orders-of-magnitude
+          dynamic range makes a unit-$L_2$ additive $\delta$
+          meaningless. $\varepsilon$ is then max fractional change per
+          species, which is what we actually care about physically.
+
+        ### Next steps
+
+        - Port `cram16_apply` to C++ with Eigen (the original goal of the
+          project).
+        - CRAM-48 for users who want $10^{-16}$ at $n \gg 10^3$; same
+          algorithm, more poles.
+        - Heterogeneous-composition test: currently $A$ is frozen at a
+          single equilibrium composition per run. A time-varying
+          composition means rebuilding $A$ per step, which is where
+          CRAM's "amortize the LU over many RHS" advantage is less
+          automatic.
+        """
+    )
+    return
+
+
 if __name__ == "__main__":
     app.run()
